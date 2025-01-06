@@ -2,6 +2,7 @@ import os
 import re
 import time
 import random
+import tiktoken
 from openai import OpenAI
 from urllib.parse import urljoin, urlparse, urldefrag
 from selenium import webdriver
@@ -22,6 +23,8 @@ class Scraper:
     """
 
     DOM_SELECTORS = [
+        "#ja-current-content", # GTA Base
+        "#ja-content", # GTA Base
         "main",  # HTML5 main element
         "article",  # HTML5 article element
         "div#content",  # Common content div
@@ -32,6 +35,7 @@ class Scraper:
         "section.main-content",  # Common content section
         "section.post",  # Common post section
         "#markdown-page",  # Common markdown page
+        "#main"
     ]
 
     def __init__(self, debug=False):
@@ -46,10 +50,16 @@ class Scraper:
         :return: A Selenium WebDriver instance.
         """
         chrome_options = Options()
-        if not self.debug:
-            chrome_options.add_argument("--headless")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--ignore-certificate-errors")
+        chrome_options.add_argument("--ignore-ssl-errors=yes")
+        chrome_options.add_argument("--allow-running-insecure-content")
+        chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)")
+
+        if not self.debug:
+            chrome_options.add_argument("--headless")
+
         chromedriver_autoinstaller.install()
         return webdriver.Chrome(options=chrome_options)
 
@@ -77,20 +87,40 @@ class Scraper:
         :param soup: The BeautifulSoup object of the webpage.
         :return: The CSS selector as a string.
         """
+
+        def num_tokens_from_string(string: str, encoding_name: str = "cl100k_base") -> int:
+            """Returns the number of tokens in a text string."""
+            encoding = tiktoken.get_encoding(encoding_name)
+            num_tokens = len(encoding.encode(string))
+            return num_tokens
+
+        def truncate_content(content: str, max_tokens: int = 6000) -> str:
+            """Truncates content to fit within max_tokens."""
+            while num_tokens_from_string(content) > max_tokens:
+                content = content[:int(len(content) * 0.9)]  # Reduce by 10% each iteration
+            return content
+
+        dom_content = str(soup.prettify())
+        truncated = False
+        if num_tokens_from_string(dom_content) > 6000:
+            dom_content = truncate_content(dom_content)
+            truncated = True
+
+        system_message = "You are a web scraping assistant, who's part of a larger automation project. Your task is to provide the CSS selector for the main content on a webpage."
+        user_message = (
+            "Please analyze the DOM structure and provide the CSS selector for the main content body, preferably "
+            "excluding headers, footers, nav bars, and other UI Elements; we ONLY want to select the main article or "
+            "main content (ie, the \"meat\" of the page content). Please ONLY return the CSS selector, and nothing "
+            "else. Your output will be used by an automated system, to gather the page's content; it is imperative that "
+            "you provide the correct CSS selector, and ONLY the CSS selector.")
+
+        if truncated:
+            user_message = "NOTE: The DOM structure provided is truncated due to length constraints. " + user_message
+
         messages = [
-            {"role": "system", "content":
-                "You are a web scraping assistant, who's part of a larger automation project. Your task is to provide the "
-                "CSS selector for the main content on a webpage."},
-            {"role": "assistant",
-             "content": "Please provide me with the DOM structure of the main content on the target web page"},
-            {"role": "user", "content": str(soup.prettify())},
-            {"role": "assistant", "content": "Thank you. What's next?"},
-            {"role": "user", "content":
-                "Please analyze the DOM structure and provide the CSS selector for the main content body, preferably "
-                "excluding headers, footers, nav bars, and other UI Elements; we ONLY want to select the main article or "
-                "main content (ie, the \"meat\" of the page content). Please ONLY return the CSS selector, and nothing "
-                "else. Your output will be used by an automated system, to gather the page's content; it is imperative that "
-                "you provide the correct CSS selector, and ONLY the CSS selector."}
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": dom_content},
+            {"role": "user", "content": user_message}
         ]
 
         backoff = 0
@@ -100,7 +130,7 @@ class Scraper:
 
         while backoff < backoff_max:
             try:
-                response = self.client.chat_completions.create(
+                response = self.client.chat.completions.create(
                     model=os.getenv('OPENAI_MODEL', 'gpt-4'),
                     messages=messages,
                     max_tokens=10,
@@ -116,21 +146,25 @@ class Scraper:
             except Exception as e:
                 if self.debug:
                     print(f"Unexpected error: {e}")
-                    return None
 
                 backoff += 1
                 time.sleep(backoff_next)
                 backoff_next *= backoff_factor
 
+        print(f"Failed to retrieve content selector for URL: {url}")
         return None
 
-    def scrape_website(self, start_url, ignore_after=None):
+    def scrape_website(self, start_url, ignore_after=None, slow=None, compile_only=None):
         """
         Scrape the website starting from the given URL and save the content as markdown files.
 
         :param start_url: The starting URL for the scraper.
         :param ignore_after: The string after which content should be ignored.
+        :param slow: Slow down the scraper to avoid rate limits.
+        :param compile_only: Only run the compilation step.
         """
+
+
         normalized_start_url = self.normalize_url(start_url)
         base_path = os.path.join('downloaded', os.path.dirname(normalized_start_url.replace('/', os.sep)))
 
@@ -145,6 +179,14 @@ class Scraper:
         to_scrape = [start_url]
         scraped = set()
 
+        # If compile_only is set, compile the markdown files and exit
+        if compile_only is not None and compile_only:
+            compile_markdown_files(base_path, compiled_markdown_path)
+            return None
+
+        # Set the first flag
+        first = True
+
         while to_scrape:
             url = to_scrape.pop(0)
             if url in scraped:
@@ -152,6 +194,12 @@ class Scraper:
 
             scraped.add(url)
             self.browser.get(url)
+
+            # If we're debugging, give the end user a chance to inspect the page
+            if self.debug and first:
+                input("Press Enter to continue...")
+
+            first = False
 
             if self.browser.title.lower() == '404 not found':
                 print(f"404 error encountered at URL: {url}")
@@ -179,7 +227,11 @@ class Scraper:
                         start_url) and new_url not in scraped and parsed_new_url.netloc == parsed_start_url.netloc:
                     to_scrape.append(new_url)
 
+            # Set up a random wait time to avoid rate limits
             wait_for = random.randint(1, 5)
+            if slow:
+                wait_for = random.randint(20, 35)
+
             print(f'Waiting for {wait_for} seconds...')
             time.sleep(wait_for)
 
